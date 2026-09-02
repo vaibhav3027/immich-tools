@@ -99,53 +99,74 @@ def get_all_tables_and_columns(conn) -> Dict[str, List[str]]:
         return tables
 
 
-def discover_asset_schema(tables: Dict[str, List[str]], requested_table: Optional[str] = None):
+def discover_schema(tables: Dict[str, List[str]], requested_table: Optional[str] = None):
     """
-    Discovers the asset table and relevant columns for thumbnails, previews, and thumbhash.
-    Supports camelCase, snake_case, lowercase, and various Immich schema versions.
+    Discovers the asset table, asset_file table (if present in modern Immich),
+    and all relevant columns for thumbnails, previews, and thumbhash.
+    Supports camelCase, snake_case, lowercase, and all Immich schema versions.
     """
-    # 1. Determine target table
-    candidate_tables = [requested_table] if requested_table else []
-    candidate_tables += ["assets", "asset", "asset_files", "asset_file"]
-
-    matched_table = None
-    for cand in candidate_tables:
-        if cand and cand in tables:
-            matched_table = cand
-            break
-
-    if not matched_table:
-        # Search for any table starting with asset
-        for t in tables:
-            if t.lower().startswith("asset"):
-                matched_table = t
-                break
-
-    if not matched_table:
-        return None, {}
-
-    cols = tables[matched_table]
-    col_map_lower = {c.lower(): c for c in cols}
-
     # Helper to find column by multiple possible names
-    def find_col(*aliases) -> Optional[str]:
+    def find_col(cols: List[str], *aliases) -> Optional[str]:
+        col_map_lower = {c.lower(): c for c in cols}
         for a in aliases:
             if a.lower() in col_map_lower:
                 return col_map_lower[a.lower()]
         return None
 
-    discovered = {
-        "id": find_col("id", "assetId", "asset_id"),
-        "resizePath": find_col("resizePath", "resize_path", "resizepath"),
-        "thumbnailPath": find_col("thumbnailPath", "thumbnail_path", "thumbnailpath"),
-        "previewPath": find_col("previewPath", "preview_path", "previewpath"),
-        "webpPath": find_col("webpPath", "webp_path", "webppath"),
-        "thumbhash": find_col("thumbhash", "thumb_hash"),
-        "encodedVideoPath": find_col("encodedVideoPath", "encoded_video_path", "encodedvideopath"),
-        "originalPath": find_col("originalPath", "original_path", "originalpath"),
+    # 1. Detect main asset table
+    candidate_asset_tables = [requested_table] if requested_table else []
+    candidate_asset_tables += ["asset", "assets"]
+    matched_asset_table = None
+    for cand in candidate_asset_tables:
+        if cand and cand in tables:
+            matched_asset_table = cand
+            break
+
+    if not matched_asset_table:
+        for t in tables:
+            if t.lower() in ["asset", "assets"]:
+                matched_asset_table = t
+                break
+
+    if not matched_asset_table:
+        return None, None, {}
+
+    asset_cols = tables[matched_asset_table]
+    asset_col_map = {
+        "id": find_col(asset_cols, "id", "assetId", "asset_id"),
+        "thumbhash": find_col(asset_cols, "thumbhash", "thumb_hash"),
+        "originalPath": find_col(asset_cols, "originalPath", "original_path", "originalpath"),
+        # Legacy path columns on asset table
+        "resizePath": find_col(asset_cols, "resizePath", "resize_path", "resizepath"),
+        "webpPath": find_col(asset_cols, "webpPath", "webp_path", "webppath"),
+        "thumbnailPath": find_col(asset_cols, "thumbnailPath", "thumbnail_path", "thumbnailpath"),
+        "previewPath": find_col(asset_cols, "previewPath", "preview_path", "previewpath"),
+        "encodedVideoPath": find_col(asset_cols, "encodedVideoPath", "encoded_video_path", "encodedvideopath"),
     }
 
-    return matched_table, discovered
+    # 2. Detect asset_file table (Modern Immich schema)
+    matched_file_table = None
+    candidate_file_tables = ["asset_file", "asset_files", "assetfile", "assetfiles"]
+    for cand in candidate_file_tables:
+        if cand in tables:
+            matched_file_table = cand
+            break
+
+    file_col_map = {}
+    if matched_file_table:
+        file_cols = tables[matched_file_table]
+        file_col_map = {
+            "id": find_col(file_cols, "id", "fileId", "file_id"),
+            "assetId": find_col(file_cols, "assetId", "asset_id", "assetid"),
+            "type": find_col(file_cols, "type", "fileType", "file_type"),
+            "path": find_col(file_cols, "path", "filePath", "file_path"),
+            "isEdited": find_col(file_cols, "isEdited", "is_edited", "isedited"),
+        }
+
+    return matched_asset_table, matched_file_table, {
+        "asset": asset_col_map,
+        "asset_file": file_col_map,
+    }
 
 
 def resolve_disk_path(db_path: Optional[str], upload_dir: Path, container_prefix: str) -> Optional[Path]:
@@ -280,9 +301,9 @@ def main():
         conn.close()
         return
 
-    table_name, discovered_cols = discover_asset_schema(tables, args.table)
+    asset_tbl, file_tbl, discovered_cols = discover_schema(tables, args.table)
 
-    if not table_name:
+    if not asset_tbl:
         print("[!] Could not find an asset table in the database.")
         print("\nAvailable tables in database:")
         for t in sorted(tables.keys()):
@@ -291,44 +312,51 @@ def main():
         conn.close()
         sys.exit(1)
 
-    print(f"[✓] Connected. Found asset table: '{table_name}'.")
+    asset_col_map = discovered_cols["asset"]
+    file_col_map = discovered_cols.get("asset_file", {})
+    id_col = asset_col_map.get("id")
+    thumbhash_col = asset_col_map.get("thumbhash")
+
+    if not id_col:
+        print(f"[!] Could not find an ID column in table '{asset_tbl}'.")
+        print(f"    Available columns: {', '.join(tables[asset_tbl])}")
+        conn.close()
+        sys.exit(1)
+
+    is_modern_schema = bool(
+        file_tbl
+        and file_col_map.get("id")
+        and file_col_map.get("assetId")
+        and file_col_map.get("type")
+        and file_col_map.get("path")
+    )
+
+    print(f"[✓] Connected to PostgreSQL.")
+    print(f"[*] Main Asset Table : '{asset_tbl}'")
+    if is_modern_schema:
+        print(f"[*] Asset File Table : '{file_tbl}' (Modern Immich schema detected)")
+    else:
+        print(f"[*] Asset File Table : None (Legacy Immich schema detected)")
     print(f"[*] Upload Directory : {upload_dir}")
     print(f"[*] Dry-Run Mode     : {'YES (No DB changes will be made)' if args.dry_run else 'NO (DB will be updated)'}")
     print(f"[*] Check Encoded Vid: {'YES' if args.check_videos else 'NO'}")
 
-    id_col = discovered_cols.get("id")
-    if not id_col:
-        print(f"[!] Could not find an ID column in table '{table_name}'.")
-        print(f"    Available columns: {', '.join(tables[table_name])}")
-        conn.close()
-        sys.exit(1)
-
-    # Collect all thumbnail/preview path columns present
-    thumb_path_cols = []
-    for key in ["resizePath", "thumbnailPath", "previewPath", "webpPath"]:
-        col = discovered_cols.get(key)
-        if col and col not in thumb_path_cols:
-            thumb_path_cols.append(col)
-
-    thumbhash_col = discovered_cols.get("thumbhash")
-    video_col = discovered_cols.get("encodedVideoPath") if args.check_videos else None
-    orig_path_col = discovered_cols.get("originalPath")
-
     print("\n[*] Detected Schema Columns:")
-    print(f"  • ID Column           : {id_col}")
-    print(f"  • Thumbnail Path(s)   : {', '.join(thumb_path_cols) if thumb_path_cols else 'None found'}")
+    print(f"  • Asset Table ID      : {id_col}")
     print(f"  • Thumbhash Column    : {thumbhash_col or 'None'}")
-    if args.check_videos:
-        print(f"  • Encoded Video Column: {video_col or 'None'}")
-
-    if not thumb_path_cols:
-        print(f"\n[!] No thumbnail or preview path columns found in table '{table_name}'.")
-        print(f"    Available columns in '{table_name}':")
-        for c in tables[table_name]:
-            print(f"      - {c}")
-        print("\nIf thumbnails are stored in another table, check with --show-schema and use --table.")
-        conn.close()
-        sys.exit(1)
+    if is_modern_schema:
+        print(f"  • Asset File Table ID : {file_col_map['id']}")
+        print(f"  • Asset File Asset ID : {file_col_map['assetId']}")
+        print(f"  • Asset File Type Col : {file_col_map['type']}")
+        print(f"  • Asset File Path Col : {file_col_map['path']}")
+    else:
+        legacy_path_cols = [
+            c for k, c in asset_col_map.items()
+            if k in ["resizePath", "webpPath", "thumbnailPath", "previewPath"] and c
+        ]
+        print(f"  • Thumbnail Path(s)   : {', '.join(legacy_path_cols) if legacy_path_cols else 'None found'}")
+        if args.check_videos:
+            print(f"  • Encoded Video Column: {asset_col_map.get('encodedVideoPath') or 'None'}")
 
     if not upload_dir.exists():
         print(f"\n[!] WARNING: Upload directory does not exist on disk: {upload_dir}")
@@ -338,101 +366,158 @@ def main():
             conn.close()
             sys.exit(1)
 
-    # Build query to fetch assets with any thumbnail path set
-    query_cols = [f'"{id_col}"']
-    for col in thumb_path_cols:
-        query_cols.append(f'"{col}"')
-    if thumbhash_col:
-        query_cols.append(f'"{thumbhash_col}"')
-    if video_col:
-        query_cols.append(f'"{video_col}"')
-    if orig_path_col:
-        query_cols.append(f'"{orig_path_col}"')
-
-    where_clauses = [f'"{c}" IS NOT NULL' for c in thumb_path_cols]
-    if thumbhash_col:
-        where_clauses.append(f'"{thumbhash_col}" IS NOT NULL')
-    if video_col:
-        where_clauses.append(f'"{video_col}" IS NOT NULL')
-
-    where_sql = " OR ".join(where_clauses)
-    query = f'SELECT {", ".join(query_cols)} FROM "{table_name}" WHERE {where_sql};'
-
-    print("\n[*] Fetching assets with registered thumbnails from database...")
-    with conn.cursor() as cur:
-        cur.execute(query)
-        rows = cur.fetchall()
-
-    total_assets = len(rows)
-    print(f"[*] Found {total_assets} candidate assets in database to verify on disk.")
-
-    missing_thumb_ids: List[Any] = []
-    missing_video_ids: List[Any] = []
+    missing_file_ids: List[Any] = []
+    missing_thumb_asset_ids: Set[Any] = set()
+    missing_video_asset_ids: Set[Any] = set()
+    missing_video_file_ids: List[Any] = []
     valid_thumbs_count = 0
-    missing_samples: List[Tuple[str, str, str]] = []
+    missing_samples: List[Tuple[str, str, str, str]] = []
 
-    # Map column index
-    raw_col_names = [c.strip('"') for c in query_cols]
-    col_idx = {name: idx for idx, name in enumerate(raw_col_names)}
+    if is_modern_schema:
+        # Modern Immich: Query asset_file table
+        f_id = file_col_map["id"]
+        f_asset_id = file_col_map["assetId"]
+        f_type = file_col_map["type"]
+        f_path = file_col_map["path"]
 
-    for row in rows:
-        asset_id = row[col_idx[id_col]]
+        target_types = ["thumbnail", "preview", "fullsize"]
+        if args.check_videos:
+            target_types.append("encoded_video")
 
-        # Check all thumbnail path columns for this asset
-        is_missing = False
-        sample_db_p = ""
-        sample_resolved_p = ""
+        query = f"""
+            SELECT "{f_id}", "{f_asset_id}", "{f_type}", "{f_path}"
+            FROM "{file_tbl}"
+            WHERE "{f_type}" = ANY(%s) AND "{f_path}" IS NOT NULL;
+        """
+        print("\n[*] Fetching thumbnail & preview file records from asset_file table...")
+        with conn.cursor() as cur:
+            cur.execute(query, (target_types,))
+            rows = cur.fetchall()
 
-        # Check if asset has thumbnail paths set
-        has_any_thumb_set = False
-        for c in thumb_path_cols:
-            p_val = row[col_idx[c]]
-            if p_val:
-                has_any_thumb_set = True
-                resolved = resolve_disk_path(p_val, upload_dir, args.container_prefix)
-                if is_file_missing_or_empty(resolved):
-                    is_missing = True
-                    sample_db_p = str(p_val)
-                    sample_resolved_p = str(resolved)
-                    break
+        total_records = len(rows)
+        print(f"[*] Found {total_records} file records in database to verify on disk.")
 
-        if has_any_thumb_set:
-            if is_missing:
-                missing_thumb_ids.append(asset_id)
+        for row in rows:
+            file_id, asset_id, file_type, db_path = row[0], row[1], str(row[2]).lower(), row[3]
+            resolved = resolve_disk_path(db_path, upload_dir, args.container_prefix)
+            if is_file_missing_or_empty(resolved):
+                if file_type == "encoded_video":
+                    missing_video_file_ids.append(file_id)
+                    missing_video_asset_ids.add(asset_id)
+                else:
+                    missing_file_ids.append(file_id)
+                    missing_thumb_asset_ids.add(asset_id)
+
                 if len(missing_samples) < 5:
-                    missing_samples.append((str(asset_id), sample_db_p, sample_resolved_p))
+                    missing_samples.append((str(asset_id), file_type, str(db_path), str(resolved)))
             else:
-                valid_thumbs_count += 1
-        elif thumbhash_col and row[col_idx[thumbhash_col]] is not None:
-            # Asset has thumbhash but no thumbnail file path
-            missing_thumb_ids.append(asset_id)
+                if file_type != "encoded_video":
+                    valid_thumbs_count += 1
 
-        # Check video if requested
+    else:
+        # Legacy Immich: Query legacy columns on assets table
+        legacy_path_cols = [
+            c for k, c in asset_col_map.items()
+            if k in ["resizePath", "webpPath", "thumbnailPath", "previewPath"] and c
+        ]
+        video_col = asset_col_map.get("encodedVideoPath") if args.check_videos else None
+
+        if not legacy_path_cols and not thumbhash_col:
+            print(f"\n[!] No thumbnail, preview, or thumbhash columns found in table '{asset_tbl}'.")
+            print(f"    Available columns in '{asset_tbl}': {', '.join(tables[asset_tbl])}")
+            conn.close()
+            sys.exit(1)
+
+        query_cols = [f'"{id_col}"']
+        for col in legacy_path_cols:
+            query_cols.append(f'"{col}"')
+        if thumbhash_col:
+            query_cols.append(f'"{thumbhash_col}"')
         if video_col:
-            v_val = row[col_idx[video_col]]
-            if v_val:
-                resolved_v = resolve_disk_path(v_val, upload_dir, args.container_prefix)
-                if is_file_missing_or_empty(resolved_v):
-                    missing_video_ids.append(asset_id)
+            query_cols.append(f'"{video_col}"')
+
+        where_clauses = [f'"{c}" IS NOT NULL' for c in legacy_path_cols]
+        if thumbhash_col:
+            where_clauses.append(f'"{thumbhash_col}" IS NOT NULL')
+        if video_col:
+            where_clauses.append(f'"{video_col}" IS NOT NULL')
+
+        where_sql = " OR ".join(where_clauses) if where_clauses else "1=1"
+        query = f'SELECT {", ".join(query_cols)} FROM "{asset_tbl}" WHERE {where_sql};'
+
+        print("\n[*] Fetching legacy thumbnail records from asset table...")
+        with conn.cursor() as cur:
+            cur.execute(query)
+            rows = cur.fetchall()
+
+        total_records = len(rows)
+        print(f"[*] Found {total_records} candidate assets in database to verify on disk.")
+
+        raw_col_names = [c.strip('"') for c in query_cols]
+        col_idx = {name: idx for idx, name in enumerate(raw_col_names)}
+
+        for row in rows:
+            asset_id = row[col_idx[id_col]]
+            is_missing = False
+            sample_type = "thumbnail"
+            sample_db_p = ""
+            sample_resolved_p = ""
+
+            has_any_thumb_set = False
+            for c in legacy_path_cols:
+                p_val = row[col_idx[c]]
+                if p_val:
+                    has_any_thumb_set = True
+                    resolved = resolve_disk_path(p_val, upload_dir, args.container_prefix)
+                    if is_file_missing_or_empty(resolved):
+                        is_missing = True
+                        sample_type = c
+                        sample_db_p = str(p_val)
+                        sample_resolved_p = str(resolved)
+                        break
+
+            if has_any_thumb_set:
+                if is_missing:
+                    missing_thumb_asset_ids.add(asset_id)
+                    if len(missing_samples) < 5:
+                        missing_samples.append((str(asset_id), sample_type, sample_db_p, sample_resolved_p))
+                else:
+                    valid_thumbs_count += 1
+            elif thumbhash_col and row[col_idx[thumbhash_col]] is not None:
+                missing_thumb_asset_ids.add(asset_id)
+
+            if video_col:
+                v_val = row[col_idx[video_col]]
+                if v_val:
+                    resolved_v = resolve_disk_path(v_val, upload_dir, args.container_prefix)
+                    if is_file_missing_or_empty(resolved_v):
+                        missing_video_asset_ids.add(asset_id)
 
     print("\n" + "-" * 70)
     print(" Scan Summary")
     print("-" * 70)
-    print(f"  • Total DB records checked       : {total_assets}")
+    print(f"  • Total DB records checked       : {total_records}")
     print(f"  • Thumbnails valid on disk       : {valid_thumbs_count}")
-    print(f"  • Thumbnails MISSING on disk     : {len(missing_thumb_ids)}")
-    if video_col:
-        print(f"  • Encoded videos MISSING on disk : {len(missing_video_ids)}")
+    if is_modern_schema:
+        print(f"  • Missing asset_file records     : {len(missing_file_ids)}")
+        print(f"  • Unique assets affected         : {len(missing_thumb_asset_ids)}")
+        if args.check_videos:
+            print(f"  • Missing encoded video files    : {len(missing_video_file_ids)}")
+    else:
+        print(f"  • Thumbnails MISSING on disk     : {len(missing_thumb_asset_ids)}")
+        if args.check_videos:
+            print(f"  • Encoded videos MISSING on disk : {len(missing_video_asset_ids)}")
     print("-" * 70)
 
     if missing_samples:
         print("\n[i] Sample missing thumbnails detected:")
-        for aid, db_p, resolved_p in missing_samples:
+        for aid, ftype, db_p, resolved_p in missing_samples:
             print(f"  - Asset ID : {aid}")
+            print(f"    Type     : {ftype}")
             print(f"    DB Path  : {db_p}")
             print(f"    Disk Path: {resolved_p}\n")
 
-    if not missing_thumb_ids and not missing_video_ids:
+    if not missing_file_ids and not missing_thumb_asset_ids and not missing_video_asset_ids:
         print("[✓] All registered thumbnails exist on disk. Nothing to invalidate!")
         conn.close()
         return
@@ -447,35 +532,82 @@ def main():
     print("\n[*] Invalidating missing thumbnails in PostgreSQL...")
     batch_size = args.batch_size
 
-    # 1. Invalidate thumbnails
-    if missing_thumb_ids:
-        set_statements = [f'"{c}" = NULL' for c in thumb_path_cols]
+    if is_modern_schema:
+        # 1. Delete missing thumbnail rows from asset_file table
+        if missing_file_ids:
+            f_id = file_col_map["id"]
+            delete_file_sql = f'DELETE FROM "{file_tbl}" WHERE "{f_id}" = ANY(%s);'
+            total_batches = (len(missing_file_ids) + batch_size - 1) // batch_size
+            with conn.cursor() as cur:
+                for i in range(0, len(missing_file_ids), batch_size):
+                    batch = missing_file_ids[i:i + batch_size]
+                    cur.execute(delete_file_sql, (batch,))
+                    conn.commit()
+                    batch_num = (i // batch_size) + 1
+                    print(f"    [Batch {batch_num}/{total_batches}] Deleted {len(batch)} missing asset_file records.")
+
+        # 2. Reset thumbhash to NULL in asset table so Immich Missing job detects them
+        if missing_thumb_asset_ids and thumbhash_col:
+            thumb_asset_list = list(missing_thumb_asset_ids)
+            update_thumbhash_sql = f'UPDATE "{asset_tbl}" SET "{thumbhash_col}" = NULL WHERE "{id_col}" = ANY(%s);'
+            total_batches = (len(thumb_asset_list) + batch_size - 1) // batch_size
+            with conn.cursor() as cur:
+                for i in range(0, len(thumb_asset_list), batch_size):
+                    batch = thumb_asset_list[i:i + batch_size]
+                    cur.execute(update_thumbhash_sql, (batch,))
+                    conn.commit()
+                    batch_num = (i // batch_size) + 1
+                    print(f"    [Thumbhash Batch {batch_num}/{total_batches}] Reset thumbhash to NULL for {len(batch)} assets.")
+
+        # 3. Handle video files if requested
+        if missing_video_file_ids:
+            f_id = file_col_map["id"]
+            delete_vid_sql = f'DELETE FROM "{file_tbl}" WHERE "{f_id}" = ANY(%s);'
+            total_vid_batches = (len(missing_video_file_ids) + batch_size - 1) // batch_size
+            with conn.cursor() as cur:
+                for i in range(0, len(missing_video_file_ids), batch_size):
+                    batch = missing_video_file_ids[i:i + batch_size]
+                    cur.execute(delete_vid_sql, (batch,))
+                    conn.commit()
+                    batch_num = (i // batch_size) + 1
+                    print(f"    [Video Batch {batch_num}/{total_vid_batches}] Deleted {len(batch)} video asset_file records.")
+
+    else:
+        # Legacy Immich: Set legacy columns to NULL on asset table
+        legacy_thumb_cols = [
+            c for k, c in asset_col_map.items()
+            if k in ["resizePath", "webpPath", "thumbnailPath", "previewPath"] and c
+        ]
         if thumbhash_col:
-            set_statements.append(f'"{thumbhash_col}" = NULL')
+            legacy_thumb_cols.append(thumbhash_col)
 
-        set_clause = ", ".join(set_statements)
-        update_thumb_sql = f'UPDATE "{table_name}" SET {set_clause} WHERE "{id_col}" = ANY(%s);'
+        thumb_asset_list = list(missing_thumb_asset_ids)
+        if thumb_asset_list and legacy_thumb_cols:
+            set_statements = [f'"{c}" = NULL' for c in legacy_thumb_cols]
+            set_clause = ", ".join(set_statements)
+            update_thumb_sql = f'UPDATE "{asset_tbl}" SET {set_clause} WHERE "{id_col}" = ANY(%s);'
 
-        total_batches = (len(missing_thumb_ids) + batch_size - 1) // batch_size
-        with conn.cursor() as cur:
-            for i in range(0, len(missing_thumb_ids), batch_size):
-                batch = missing_thumb_ids[i:i + batch_size]
-                cur.execute(update_thumb_sql, (batch,))
-                conn.commit()
-                batch_num = (i // batch_size) + 1
-                print(f"    [Batch {batch_num}/{total_batches}] Invalidated {len(batch)} asset thumbnail records.")
+            total_batches = (len(thumb_asset_list) + batch_size - 1) // batch_size
+            with conn.cursor() as cur:
+                for i in range(0, len(thumb_asset_list), batch_size):
+                    batch = thumb_asset_list[i:i + batch_size]
+                    cur.execute(update_thumb_sql, (batch,))
+                    conn.commit()
+                    batch_num = (i // batch_size) + 1
+                    print(f"    [Batch {batch_num}/{total_batches}] Invalidated {len(batch)} asset thumbnail records.")
 
-    # 2. Invalidate videos if requested
-    if missing_video_ids and video_col:
-        update_vid_sql = f'UPDATE "{table_name}" SET "{video_col}" = NULL WHERE "{id_col}" = ANY(%s);'
-        total_vid_batches = (len(missing_video_ids) + batch_size - 1) // batch_size
-        with conn.cursor() as cur:
-            for i in range(0, len(missing_video_ids), batch_size):
-                batch = missing_video_ids[i:i + batch_size]
-                cur.execute(update_vid_sql, (batch,))
-                conn.commit()
-                batch_num = (i // batch_size) + 1
-                print(f"    [Video Batch {batch_num}/{total_vid_batches}] Invalidated {len(batch)} video records.")
+        video_col = asset_col_map.get("encodedVideoPath")
+        video_asset_list = list(missing_video_asset_ids)
+        if video_asset_list and video_col:
+            update_vid_sql = f'UPDATE "{asset_tbl}" SET "{video_col}" = NULL WHERE "{id_col}" = ANY(%s);'
+            total_vid_batches = (len(video_asset_list) + batch_size - 1) // batch_size
+            with conn.cursor() as cur:
+                for i in range(0, len(video_asset_list), batch_size):
+                    batch = video_asset_list[i:i + batch_size]
+                    cur.execute(update_vid_sql, (batch,))
+                    conn.commit()
+                    batch_num = (i // batch_size) + 1
+                    print(f"    [Video Batch {batch_num}/{total_vid_batches}] Invalidated {len(batch)} video records.")
 
     conn.close()
     print("\n" + "=" * 70)
@@ -491,3 +623,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
