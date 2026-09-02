@@ -536,11 +536,11 @@ def main():
         # 1. Delete missing thumbnail rows from asset_file table
         if missing_file_ids:
             f_id = file_col_map["id"]
-            delete_file_sql = f'DELETE FROM "{file_tbl}" WHERE "{f_id}" = ANY(%s);'
+            delete_file_sql = f'DELETE FROM "{file_tbl}" WHERE "{f_id}" = ANY(%s::uuid[]);'
             total_batches = (len(missing_file_ids) + batch_size - 1) // batch_size
             with conn.cursor() as cur:
                 for i in range(0, len(missing_file_ids), batch_size):
-                    batch = missing_file_ids[i:i + batch_size]
+                    batch = [str(x) for x in missing_file_ids[i:i + batch_size]]
                     cur.execute(delete_file_sql, (batch,))
                     conn.commit()
                     batch_num = (i // batch_size) + 1
@@ -549,11 +549,11 @@ def main():
         # 2. Reset thumbhash to NULL in asset table so Immich Missing job detects them
         if missing_thumb_asset_ids and thumbhash_col:
             thumb_asset_list = list(missing_thumb_asset_ids)
-            update_thumbhash_sql = f'UPDATE "{asset_tbl}" SET "{thumbhash_col}" = NULL WHERE "{id_col}" = ANY(%s);'
+            update_thumbhash_sql = f'UPDATE "{asset_tbl}" SET "{thumbhash_col}" = NULL WHERE "{id_col}" = ANY(%s::uuid[]);'
             total_batches = (len(thumb_asset_list) + batch_size - 1) // batch_size
             with conn.cursor() as cur:
                 for i in range(0, len(thumb_asset_list), batch_size):
-                    batch = thumb_asset_list[i:i + batch_size]
+                    batch = [str(x) for x in thumb_asset_list[i:i + batch_size]]
                     cur.execute(update_thumbhash_sql, (batch,))
                     conn.commit()
                     batch_num = (i // batch_size) + 1
@@ -562,11 +562,11 @@ def main():
         # 3. Handle video files if requested
         if missing_video_file_ids:
             f_id = file_col_map["id"]
-            delete_vid_sql = f'DELETE FROM "{file_tbl}" WHERE "{f_id}" = ANY(%s);'
+            delete_vid_sql = f'DELETE FROM "{file_tbl}" WHERE "{f_id}" = ANY(%s::uuid[]);'
             total_vid_batches = (len(missing_video_file_ids) + batch_size - 1) // batch_size
             with conn.cursor() as cur:
                 for i in range(0, len(missing_video_file_ids), batch_size):
-                    batch = missing_video_file_ids[i:i + batch_size]
+                    batch = [str(x) for x in missing_video_file_ids[i:i + batch_size]]
                     cur.execute(delete_vid_sql, (batch,))
                     conn.commit()
                     batch_num = (i // batch_size) + 1
@@ -585,12 +585,12 @@ def main():
         if thumb_asset_list and legacy_thumb_cols:
             set_statements = [f'"{c}" = NULL' for c in legacy_thumb_cols]
             set_clause = ", ".join(set_statements)
-            update_thumb_sql = f'UPDATE "{asset_tbl}" SET {set_clause} WHERE "{id_col}" = ANY(%s);'
+            update_thumb_sql = f'UPDATE "{asset_tbl}" SET {set_clause} WHERE "{id_col}" = ANY(%s::uuid[]);'
 
             total_batches = (len(thumb_asset_list) + batch_size - 1) // batch_size
             with conn.cursor() as cur:
                 for i in range(0, len(thumb_asset_list), batch_size):
-                    batch = thumb_asset_list[i:i + batch_size]
+                    batch = [str(x) for x in thumb_asset_list[i:i + batch_size]]
                     cur.execute(update_thumb_sql, (batch,))
                     conn.commit()
                     batch_num = (i // batch_size) + 1
@@ -599,11 +599,11 @@ def main():
         video_col = asset_col_map.get("encodedVideoPath")
         video_asset_list = list(missing_video_asset_ids)
         if video_asset_list and video_col:
-            update_vid_sql = f'UPDATE "{asset_tbl}" SET "{video_col}" = NULL WHERE "{id_col}" = ANY(%s);'
+            update_vid_sql = f'UPDATE "{asset_tbl}" SET "{video_col}" = NULL WHERE "{id_col}" = ANY(%s::uuid[]);'
             total_vid_batches = (len(video_asset_list) + batch_size - 1) // batch_size
             with conn.cursor() as cur:
                 for i in range(0, len(video_asset_list), batch_size):
-                    batch = video_asset_list[i:i + batch_size]
+                    batch = [str(x) for x in video_asset_list[i:i + batch_size]]
                     cur.execute(update_vid_sql, (batch,))
                     conn.commit()
                     batch_num = (i // batch_size) + 1
