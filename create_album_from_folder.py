@@ -15,11 +15,15 @@ if not API_KEY:
     raise SystemExit(" -- x - IMMICH_KEY not set in environment - x --")
 
 # === INPUT ===
-folder_path = input("- Enter full folder path (e.g. /Volumes/ssd/Vacation): ").rstrip("/")
-album_name = input("- Enter album name (leave blank to auto-use folder name): ").strip()
+raw_paths = input("- Enter comma-separated folder paths: ").strip()
+folder_paths = [p.strip().rstrip("/") for p in raw_paths.split(",") if p.strip()]
 
+if not folder_paths:
+    raise SystemExit("No valid paths entered")
+
+album_name = input("- Enter album name (leave blank to auto-use first folder name): ").strip()
 if not album_name:
-    album_name = pathlib.PurePath(folder_path).name
+    album_name = pathlib.PurePath(folder_paths[0]).name
     print(f"- | Album name not entered — using folder name: '{album_name}'")
 
 headers = {
@@ -29,7 +33,7 @@ headers = {
 
 
 # === FUNCTION: Fetch all pages ===
-def fetch_all_assets(folder_path: str, page_size: int = 1000): # Max page size limit in immich is 1000
+def fetch_all_assets(folder_path: str, page_size: int = 1000):  # Max page size limit in immich is 1000
     all_assets = []
     page = 1
 
@@ -85,23 +89,26 @@ def find_unique_album_name(base_name, existing_albums):
         i += 1
 
 
-# === FETCH ALL ASSETS ===
-print(f"- | Searching for assets in '{folder_path}'...")
-assets = fetch_all_assets(folder_path)
+# === FETCH ALL ASSETS (MULTIPLE FOLDERS) ===
+assets = []
+for folder_path in folder_paths:
+    print(f"- | Searching for assets in '{folder_path}'...")
+    assets.extend(fetch_all_assets(folder_path))
 
 if not assets:
-    raise SystemExit("No assets found for that folder path")
+    raise SystemExit("No assets found for those folder paths")
 
-# === FILTER EXACT FILES IN THAT DIRECTORY ===
+
+# === FILTER EXACT FILES IN THOSE DIRECTORIES ===
 filtered_assets = []
-base_path = pathlib.PurePath(folder_path)
+base_paths = [pathlib.PurePath(p) for p in folder_paths]
 
 for a in assets:
-    asset_path = pathlib.PurePath(a["originalPath"]).parent
-    if asset_path == base_path:
+    parent = pathlib.PurePath(a["originalPath"]).parent
+    if parent in base_paths:
         filtered_assets.append(a)
 
-print(f"- | Found {len(filtered_assets)} matching assets directly in folder")
+print(f"- | Found {len(filtered_assets)} matching assets directly in folder(s)")
 if not filtered_assets:
     raise SystemExit("No exact matches (maybe all files are in subfolders)")
 
