@@ -14,3 +14,5 @@
 - Noted how to invalidate person thumbnails: set `person."thumbnailPath" = ''` for missing files on disk, then trigger "Generate Thumbnails" -> "Missing" in Immich Admin Jobs.
 - Noted APIs for forcefully regenerating person/face thumbnails: PUT /api/people (with featureFaceAssetId) or POST /api/jobs / PUT /api/jobs/generate-thumbnails with force: true.
 - Created `regenerate_face_thumbnails.py` to fetch all faces/people, invalidate `thumbnailPath` in Postgres (or via API), and trigger Immich thumbnail regeneration.
+- Created `extract_face_thumbnails.py` to query `SELECT "thumbnailPath" FROM public.person`, preserve subpath after `upload/thumbs/`, and copy thumbnails to `./facesThumbnails`.
+- Updated `refetch_missing_video_metadata.py` to inspect database (`asset_file` and `asset`) and API to verify availability of encoded video (`encoded_video` / `encodedVideoPath`) and thumbnail (`thumbnail`/`preview`/`thumbhash`). If either is missing or if technical metadata is missing, it queues the video for metadata refetch via `POST /api/assets/jobs` (`refresh-metadata`).
