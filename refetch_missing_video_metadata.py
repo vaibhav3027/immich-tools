@@ -234,7 +234,7 @@ def scan_videos_db(conn, args: argparse.Namespace) -> List[Dict[str, Any]]:
         h_c = f'e."{exif_map["height"]}"' if exif_map.get("height") else "NULL"
         dt_c = f'e."{exif_map["dateTimeOriginal"]}"' if exif_map.get("dateTimeOriginal") else "NULL"
 
-        exif_join = f'LEFT JOIN "{exif_table}" e ON {id_col} = {e_asset_id}'
+        exif_join = f'LEFT JOIN "{exif_table}" e ON {id_col}::text = {e_asset_id}::text'
         exif_selects = [
             f"{fps_c} AS fps",
             f"{w_c} AS width",
@@ -251,13 +251,13 @@ def scan_videos_db(conn, args: argparse.Namespace) -> List[Dict[str, Any]]:
         f_path = file_map["path"]
         encoded_conditions.append(f"""EXISTS (
             SELECT 1 FROM "{file_table}" f
-            WHERE f."{f_asset_id}" = {id_col}
-              AND LOWER(f."{f_type}") IN ('encoded_video', 'encoded-video')
+            WHERE f."{f_asset_id}"::text = {id_col}::text
+              AND LOWER(f."{f_type}"::text) IN ('encoded_video', 'encoded-video')
               AND f."{f_path}" IS NOT NULL
-              AND TRIM(f."{f_path}") != ''
+              AND TRIM(f."{f_path}"::text) != ''
         )""")
     if encoded_col:
-        encoded_conditions.append(f'(a."{encoded_col}" IS NOT NULL AND TRIM(a."{encoded_col}") != \'\')')
+        encoded_conditions.append(f'(a."{encoded_col}" IS NOT NULL AND TRIM(a."{encoded_col}"::text) != \'\')')
 
     if encoded_conditions:
         encoded_expr = f"CASE WHEN ({' OR '.join(encoded_conditions)}) THEN 1 ELSE 0 END"
@@ -272,15 +272,15 @@ def scan_videos_db(conn, args: argparse.Namespace) -> List[Dict[str, Any]]:
         f_path = file_map["path"]
         thumb_conditions.append(f"""EXISTS (
             SELECT 1 FROM "{file_table}" f
-            WHERE f."{f_asset_id}" = {id_col}
-              AND LOWER(f."{f_type}") IN ('thumbnail', 'preview', 'fullsize')
+            WHERE f."{f_asset_id}"::text = {id_col}::text
+              AND LOWER(f."{f_type}"::text) IN ('thumbnail', 'preview', 'fullsize')
               AND f."{f_path}" IS NOT NULL
-              AND TRIM(f."{f_path}") != ''
+              AND TRIM(f."{f_path}"::text) != ''
         )""")
     if thumbhash_col:
-        thumb_conditions.append(f'(a."{thumbhash_col}" IS NOT NULL AND TRIM(a."{thumbhash_col}") != \'\')')
+        thumb_conditions.append(f'(a."{thumbhash_col}" IS NOT NULL AND length(a."{thumbhash_col}") > 0)')
     if thumb_path_col:
-        thumb_conditions.append(f'(a."{thumb_path_col}" IS NOT NULL AND TRIM(a."{thumb_path_col}") != \'\')')
+        thumb_conditions.append(f'(a."{thumb_path_col}" IS NOT NULL AND TRIM(a."{thumb_path_col}"::text) != \'\')')
 
     if thumb_conditions:
         thumb_expr = f"CASE WHEN ({' OR '.join(thumb_conditions)}) THEN 1 ELSE 0 END"
