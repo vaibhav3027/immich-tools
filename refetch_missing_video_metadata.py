@@ -167,6 +167,7 @@ def discover_video_schema(tables: Dict[str, List[str]]):
         "thumbhash": find_col(asset_cols, "thumbhash", "thumb_hash"),
         "thumbnailPath": find_col(asset_cols, "thumbnailPath", "thumbnail_path", "thumbnailpath", "resizePath", "resize_path", "previewPath", "preview_path"),
         "encodedVideoPath": find_col(asset_cols, "encodedVideoPath", "encoded_video_path", "encodedvideopath"),
+        "ownerId": find_col(asset_cols, "ownerId", "owner_id", "userId", "user_id"),
         "isArchived": find_col(asset_cols, "isArchived", "is_archived"),
         "isTrashed": find_col(asset_cols, "isTrashed", "is_trashed"),
         "deletedAt": find_col(asset_cols, "deletedAt", "deleted_at")
@@ -223,6 +224,8 @@ def scan_videos_db(conn, args: argparse.Namespace) -> List[Dict[str, Any]]:
         conditions.append(f'a."{asset_map["isTrashed"]}" = false')
     if asset_map.get("deletedAt"):
         conditions.append(f'a."{asset_map["deletedAt"]}" IS NULL')
+    if asset_map.get("ownerId") and getattr(args, "user_id", None):
+        conditions.append(f'a."{asset_map["ownerId"]}"::text = \'{args.user_id}\'')
 
     exif_join = ""
     exif_selects = ["NULL AS fps", "NULL AS width", "NULL AS height", "NULL AS date_time_orig", "NULL AS has_exif"]
@@ -459,6 +462,21 @@ def scan_videos_api(immich_url: str, api_key: str, args: argparse.Namespace) -> 
     return missing_assets
 
 
+def get_current_user_id(immich_url: str, api_key: str) -> Optional[str]:
+    """Fetches the authenticated user ID from /api/users/me."""
+    if not requests or not api_key:
+        return None
+    try:
+        url = f"{immich_url.rstrip('/')}/api/users/me"
+        headers = {"x-api-key": api_key, "Accept": "application/json"}
+        resp = requests.get(url, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            return resp.json().get("id")
+    except Exception:
+        pass
+    return None
+
+
 def trigger_metadata_refetch(immich_url: str, api_key: str, asset_ids: List[str], batch_size: int = 100) -> Tuple[int, int]:
     """Triggers the refresh-metadata job for specified asset UUIDs."""
     if not requests:
@@ -484,17 +502,38 @@ def trigger_metadata_refetch(immich_url: str, api_key: str, asset_ids: List[str]
             "name": "refresh-metadata"
         }
 
+        resp = None
+        err_msg = ""
         try:
             resp = requests.post(url, headers=headers, json=payload, timeout=30)
-            if resp.status_code in (200, 201, 204):
-                success_count += len(batch)
-                print(f"    [Batch {batch_num}/{total_batches}] Queued {len(batch)} videos.")
-            else:
-                fail_count += len(batch)
-                print(f"    [Batch {batch_num}/{total_batches}] Failed ({resp.status_code}): {resp.text}")
         except Exception as e:
+            err_msg = str(e)
+
+        if resp is not None and resp.status_code in (200, 201, 204):
+            success_count += len(batch)
+            print(f"    [Batch {batch_num}/{total_batches}] Queued {len(batch)} videos.")
+        elif resp is not None and resp.status_code == 400 and len(batch) > 1:
+            # Batch rejected due to one or more inaccessible assets (e.g. partner-shared / locked)
+            print(f"    [Batch {batch_num}/{total_batches}] Permission error on batch (400). Retrying individually...")
+            batch_success = 0
+            batch_fail = 0
+            for item_id in batch:
+                try:
+                    s_resp = requests.post(url, headers=headers, json={"assetIds": [item_id], "name": "refresh-metadata"}, timeout=15)
+                    if s_resp.status_code in (200, 201, 204):
+                        batch_success += 1
+                    else:
+                        batch_fail += 1
+                except Exception:
+                    batch_fail += 1
+            success_count += batch_success
+            fail_count += batch_fail
+            print(f"    [Batch {batch_num}/{total_batches}] -> {batch_success} queued, {batch_fail} skipped (no update access).")
+        else:
             fail_count += len(batch)
-            print(f"    [Batch {batch_num}/{total_batches}] Request failed: {e}")
+            status_desc = resp.status_code if resp is not None else "Error"
+            text_desc = resp.text if resp is not None else err_msg
+            print(f"    [Batch {batch_num}/{total_batches}] Failed ({status_desc}): {text_desc}")
 
     return success_count, fail_count
 
@@ -523,6 +562,10 @@ def main():
     parser.add_argument("--no-check-resolution", dest="check_resolution", action="store_false", help="Ignore missing resolution.")
     parser.add_argument("--check-date", action="store_true", default=False, help="Flag video if capture date (dateTimeOriginal) is null.")
 
+    # User scoping options
+    parser.add_argument("--user-id", type=str, default=None, help="Scope database scan to specific user ID (default: auto-detect from API key).")
+    parser.add_argument("--all-users", action="store_true", help="Scan assets across all users in database (disabled by default to prevent permission errors on partner-shared assets).")
+
     # Immich API connection options
     parser.add_argument("--immich-url", type=str, default=None, help="Immich URL (e.g. http://localhost:2283)")
     parser.add_argument("--api-key", type=str, default=None, help="Immich API Key")
@@ -544,6 +587,13 @@ def main():
         print("[!] Error: IMMICH_KEY (or IMMICH_API_KEY) is required to trigger metadata refetch.")
         print("    Please configure it in .env or pass via --api-key.")
         sys.exit(1)
+
+    # Auto-detect current user ID from API key if not explicitly set
+    if not args.all_users and not args.user_id and api_key:
+        detected_user_id = get_current_user_id(immich_url, api_key)
+        if detected_user_id:
+            args.user_id = detected_user_id
+            print(f"[*] Scoping scan to authenticated user ID: {detected_user_id}")
 
     print("=" * 70)
     print(" Immich Missing Video Metadata, Encoded Video & Thumbnail Detector")
