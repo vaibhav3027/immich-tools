@@ -1,0 +1,509 @@
+#!/usr/bin/env python3
+"""
+refetch_missing_video_metadata.py
+
+Searches all videos in Immich, checks for missing metadata (e.g., duration,
+EXIF record, FPS, resolution, capture date), and triggers refetching/re-extraction
+of metadata for those assets via the Immich API.
+
+Usage:
+  # Dry-run scan using API
+  python refetch_missing_video_metadata.py --dry-run
+
+  # Scan and trigger refetch via API
+  python refetch_missing_video_metadata.py -y
+
+  # Prefer PostgreSQL for faster library scan, then trigger API job
+  python refetch_missing_video_metadata.py
+
+  # Check specific missing criteria (e.g., only missing duration or EXIF)
+  python refetch_missing_video_metadata.py --require-duration --require-exif
+"""
+
+import os
+import sys
+import argparse
+from typing import Optional, List, Dict, Any, Tuple
+
+# Load .env if present
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+try:
+    import requests
+except ImportError:
+    requests = None
+
+# PostgreSQL driver support (psycopg2 or psycopg3)
+try:
+    import psycopg2
+    import psycopg2.extras
+    PSYCOPG_VERSION = 2
+except ImportError:
+    try:
+        import psycopg
+        PSYCOPG_VERSION = 3
+    except ImportError:
+        PSYCOPG_VERSION = None
+
+
+def is_duration_empty(duration: Any) -> bool:
+    """Checks if a duration value is null, zero, or unpopulated."""
+    if duration is None:
+        return True
+    dur_str = str(duration).strip()
+    if not dur_str:
+        return True
+    # Common zero duration representations: 0, 0:00:00, 0:00:00.000000, 00:00:00
+    zero_patterns = {"0", "0.0", "0:00:00", "00:00:00", "0:00:00.000000", "00:00:00.000000"}
+    if dur_str in zero_patterns:
+        return True
+    try:
+        if float(dur_str) == 0.0:
+            return True
+    except ValueError:
+        pass
+    return False
+
+
+def get_db_connection(args: argparse.Namespace):
+    """Establishes connection to the PostgreSQL database if available."""
+    if PSYCOPG_VERSION is None:
+        return None
+
+    db_url = args.db_url or os.getenv("DB_URL") or os.getenv("DATABASE_URL")
+    host = args.db_host or os.getenv("DB_HOSTNAME") or os.getenv("DB_HOST", "localhost")
+    port = int(args.db_port or os.getenv("DB_PORT", 5432))
+    user = args.db_user or os.getenv("DB_USERNAME") or os.getenv("DB_USER", "postgres")
+    password = args.db_password or os.getenv("DB_PASSWORD", "postgres")
+    dbname = args.db_name or os.getenv("DB_DATABASE_NAME") or os.getenv("DB_NAME", "immich")
+
+    try:
+        if db_url:
+            if PSYCOPG_VERSION == 2:
+                return psycopg2.connect(db_url, connect_timeout=5)
+            return psycopg.connect(db_url, timeout=5)
+        if PSYCOPG_VERSION == 2:
+            return psycopg2.connect(
+                host=host,
+                port=port,
+                user=user,
+                password=password,
+                dbname=dbname,
+                connect_timeout=5
+            )
+        return psycopg.connect(
+            host=host,
+            port=port,
+            user=user,
+            password=password,
+            dbname=dbname,
+            timeout=5
+        )
+    except Exception as e:
+        if not args.api_only and not args.quiet:
+            print(f"[!] PostgreSQL connection unavailable ({e}). Falling back to Immich API.")
+        return None
+
+
+def get_all_tables_and_columns(conn) -> Dict[str, List[str]]:
+    """Inspects all tables and columns in public schema."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT table_name, column_name 
+            FROM information_schema.columns 
+            WHERE table_schema = 'public' 
+            ORDER BY table_name, ordinal_position;
+        """)
+        tables: Dict[str, List[str]] = {}
+        for table, col in cur.fetchall():
+            tables.setdefault(table, []).append(col)
+        return tables
+
+
+def discover_video_schema(tables: Dict[str, List[str]]):
+    """Discovers asset and exif table and column names."""
+    def find_col(cols: List[str], *aliases) -> Optional[str]:
+        col_map_lower = {c.lower(): c for c in cols}
+        for a in aliases:
+            if a.lower() in col_map_lower:
+                return col_map_lower[a.lower()]
+        return None
+
+    asset_table = None
+    for cand in ["asset", "assets"]:
+        if cand in tables:
+            asset_table = cand
+            break
+
+    exif_table = None
+    for cand in ["asset_exif", "exif", "asset_exifs"]:
+        if cand in tables:
+            exif_table = cand
+            break
+
+    if not asset_table:
+        return None, None, {}, {}
+
+    asset_cols = tables[asset_table]
+    asset_map = {
+        "id": find_col(asset_cols, "id", "assetId", "asset_id"),
+        "type": find_col(asset_cols, "type", "assetType", "asset_type"),
+        "duration": find_col(asset_cols, "duration"),
+        "originalPath": find_col(asset_cols, "originalPath", "original_path", "originalpath"),
+        "isArchived": find_col(asset_cols, "isArchived", "is_archived"),
+        "isTrashed": find_col(asset_cols, "isTrashed", "is_trashed"),
+        "deletedAt": find_col(asset_cols, "deletedAt", "deleted_at")
+    }
+
+    exif_map = {}
+    if exif_table:
+        exif_cols = tables[exif_table]
+        exif_map = {
+            "assetId": find_col(exif_cols, "assetId", "asset_id", "assetid"),
+            "fps": find_col(exif_cols, "fps"),
+            "width": find_col(exif_cols, "exifImageWidth", "exif_image_width", "width"),
+            "height": find_col(exif_cols, "exifImageHeight", "exif_image_height", "height"),
+            "dateTimeOriginal": find_col(exif_cols, "dateTimeOriginal", "date_time_original", "dateTime"),
+            "videoCodec": find_col(exif_cols, "videoCodec", "video_codec")
+        }
+
+    return asset_table, exif_table, asset_map, exif_map
+
+
+def scan_videos_db(conn, args: argparse.Namespace) -> List[Dict[str, Any]]:
+    """Scans videos directly from PostgreSQL database."""
+    tables = get_all_tables_and_columns(conn)
+    asset_table, exif_table, asset_map, exif_map = discover_video_schema(tables)
+
+    if not asset_table or not asset_map.get("id"):
+        print("[!] Could not resolve asset table schema. Falling back to API mode.")
+        return []
+
+    id_col = f'a."{asset_map["id"]}"'
+    type_col = f'a."{asset_map["type"]}"' if asset_map.get("type") else None
+    dur_col = f'a."{asset_map["duration"]}"' if asset_map.get("duration") else "NULL"
+    path_col = f'a."{asset_map["originalPath"]}"' if asset_map.get("originalPath") else "NULL"
+
+    conditions = []
+    if type_col:
+        conditions.append(f"{type_col} = 'VIDEO'")
+
+    if asset_map.get("isTrashed"):
+        conditions.append(f'a."{asset_map["isTrashed"]}" = false')
+    if asset_map.get("deletedAt"):
+        conditions.append(f'a."{asset_map["deletedAt"]}" IS NULL')
+
+    exif_join = ""
+    exif_selects = ["NULL AS fps", "NULL AS width", "NULL AS height", "NULL AS date_time_orig", "NULL AS has_exif"]
+
+    if exif_table and exif_map.get("assetId"):
+        e_asset_id = f'e."{exif_map["assetId"]}"'
+        fps_c = f'e."{exif_map["fps"]}"' if exif_map.get("fps") else "NULL"
+        w_c = f'e."{exif_map["width"]}"' if exif_map.get("width") else "NULL"
+        h_c = f'e."{exif_map["height"]}"' if exif_map.get("height") else "NULL"
+        dt_c = f'e."{exif_map["dateTimeOriginal"]}"' if exif_map.get("dateTimeOriginal") else "NULL"
+
+        exif_join = f'LEFT JOIN "{exif_table}" e ON {id_col} = {e_asset_id}'
+        exif_selects = [
+            f"{fps_c} AS fps",
+            f"{w_c} AS width",
+            f"{h_c} AS height",
+            f"{dt_c} AS date_time_orig",
+            f"CASE WHEN {e_asset_id} IS NOT NULL THEN 1 ELSE 0 END AS has_exif"
+        ]
+
+    where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    query = f"""
+        SELECT 
+            {id_col} AS id,
+            {path_col} AS original_path,
+            {dur_col} AS duration,
+            {', '.join(exif_selects)}
+        FROM "{asset_table}" a
+        {exif_join}
+        {where_clause};
+    """
+
+    results = []
+    with conn.cursor() as cur:
+        cur.execute(query)
+        rows = cur.fetchall()
+
+    for r in rows:
+        asset_id = str(r[0])
+        original_path = r[1] or ""
+        duration = r[2]
+        fps = r[3]
+        width = r[4]
+        height = r[5]
+        dt_orig = r[6]
+        has_exif = bool(r[7]) if len(r) > 7 and r[7] is not None else True
+
+        missing_reasons = []
+
+        if is_duration_empty(duration):
+            missing_reasons.append("missing duration")
+
+        if exif_table:
+            if not has_exif:
+                missing_reasons.append("missing EXIF record")
+            else:
+                if (fps is None or fps == 0) and args.check_fps:
+                    missing_reasons.append("missing FPS")
+                if (width is None or width == 0 or height is None or height == 0) and args.check_resolution:
+                    missing_reasons.append("missing dimensions")
+                if dt_orig is None and args.check_date:
+                    missing_reasons.append("missing capture date")
+
+        if missing_reasons:
+            results.append({
+                "id": asset_id,
+                "path": original_path,
+                "reasons": missing_reasons,
+                "duration": duration
+            })
+
+    return results
+
+
+def scan_videos_api(immich_url: str, api_key: str, args: argparse.Namespace) -> List[Dict[str, Any]]:
+    """Scans all videos using Immich REST API (/api/search/metadata)."""
+    if not requests:
+        print("[!] Error: 'requests' package is required. Install via: pip install requests")
+        sys.exit(1)
+
+    url = f"{immich_url.rstrip('/')}/api/search/metadata"
+    headers = {
+        "x-api-key": api_key,
+        "Accept": "application/json",
+        "Content-Type": "application/json"
+    }
+
+    page = 1
+    page_size = 1000
+    missing_assets = []
+    total_videos_checked = 0
+
+    print("[*] Fetching videos via Immich API...")
+
+    while True:
+        payload = {
+            "type": "VIDEO",
+            "withExif": True,
+            "isVisible": True,
+            "page": page,
+            "size": page_size
+        }
+
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=60)
+            if resp.status_code != 200:
+                print(f"[!] API Search failed on page {page} ({resp.status_code}): {resp.text}")
+                break
+
+            data = resp.json()
+            assets = data.get("assets", {}).get("items", []) if isinstance(data, dict) else []
+            if not assets:
+                break
+
+            total_videos_checked += len(assets)
+            print(f"    Scanning page {page} ({len(assets)} videos)...", end="\r", flush=True)
+
+            for asset in assets:
+                asset_id = asset.get("id")
+                original_path = asset.get("originalPath") or asset.get("originalFileName") or ""
+                duration = asset.get("duration")
+                exif = asset.get("exifInfo")
+
+                missing_reasons = []
+
+                if is_duration_empty(duration):
+                    missing_reasons.append("missing duration")
+
+                if exif is None:
+                    missing_reasons.append("missing EXIF record")
+                else:
+                    fps = exif.get("fps")
+                    w = exif.get("exifImageWidth")
+                    h = exif.get("exifImageHeight")
+                    dt_orig = exif.get("dateTimeOriginal")
+
+                    if (fps is None or fps == 0) and args.check_fps:
+                        missing_reasons.append("missing FPS")
+                    if (w is None or w == 0 or h is None or h == 0) and args.check_resolution:
+                        missing_reasons.append("missing dimensions")
+                    if dt_orig is None and args.check_date:
+                        missing_reasons.append("missing capture date")
+
+                if missing_reasons:
+                    missing_assets.append({
+                        "id": asset_id,
+                        "path": original_path,
+                        "reasons": missing_reasons,
+                        "duration": duration
+                    })
+
+            if len(assets) < page_size:
+                break
+            page += 1
+
+        except Exception as e:
+            print(f"\n[!] Error querying Immich API: {e}")
+            break
+
+    print(f"\n[*] Checked {total_videos_checked} total video assets via API.")
+    return missing_assets
+
+
+def trigger_metadata_refetch(immich_url: str, api_key: str, asset_ids: List[str], batch_size: int = 100) -> Tuple[int, int]:
+    """Triggers the refresh-metadata job for specified asset UUIDs."""
+    if not requests:
+        print("[!] Error: 'requests' package is required.")
+        return 0, len(asset_ids)
+
+    url = f"{immich_url.rstrip('/')}/api/assets/jobs"
+    headers = {
+        "x-api-key": api_key,
+        "Accept": "application/json",
+        "Content-Type": "application/json"
+    }
+
+    success_count = 0
+    fail_count = 0
+    total_batches = (len(asset_ids) + batch_size - 1) // batch_size
+
+    for i in range(0, len(asset_ids), batch_size):
+        batch = asset_ids[i:i + batch_size]
+        batch_num = (i // batch_size) + 1
+        payload = {
+            "assetIds": batch,
+            "name": "refresh-metadata"
+        }
+
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=30)
+            if resp.status_code in (200, 201, 204):
+                success_count += len(batch)
+                print(f"    [Batch {batch_num}/{total_batches}] Queued {len(batch)} videos.")
+            else:
+                fail_count += len(batch)
+                print(f"    [Batch {batch_num}/{total_batches}] Failed ({resp.status_code}): {resp.text}")
+        except Exception as e:
+            fail_count += len(batch)
+            print(f"    [Batch {batch_num}/{total_batches}] Request failed: {e}")
+
+    return success_count, fail_count
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Search videos in Immich, check for missing metadata, and trigger refetching."
+    )
+    parser.add_argument("--dry-run", action="store_true", help="Scan only; do not trigger metadata refetch.")
+    parser.add_argument("--api-only", action="store_true", help="Force API scanning instead of connecting to PostgreSQL.")
+    parser.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt.")
+    parser.add_argument("--batch-size", type=int, default=100, help="Batch size for triggering asset jobs (default: 100).")
+    parser.add_argument("--limit", type=int, default=None, help="Limit number of missing video assets to trigger.")
+    parser.add_argument("--quiet", action="store_true", help="Suppress non-essential log output.")
+
+    # Metadata check options
+    parser.add_argument("--check-fps", action="store_true", default=True, help="Flag video as missing if FPS is null or 0 (default: True).")
+    parser.add_argument("--no-check-fps", dest="check_fps", action="store_false", help="Ignore missing FPS.")
+    parser.add_argument("--check-resolution", action="store_true", default=True, help="Flag video as missing if width/height is null/0 (default: True).")
+    parser.add_argument("--no-check-resolution", dest="check_resolution", action="store_false", help="Ignore missing resolution.")
+    parser.add_argument("--check-date", action="store_true", default=False, help="Flag video as missing if capture date (dateTimeOriginal) is null.")
+
+    # Immich API connection options
+    parser.add_argument("--immich-url", type=str, default=None, help="Immich URL (e.g. http://localhost:2283)")
+    parser.add_argument("--api-key", type=str, default=None, help="Immich API Key")
+
+    # DB connection options
+    parser.add_argument("--db-url", type=str, default=None, help="PostgreSQL connection URL")
+    parser.add_argument("--db-host", type=str, default=None, help="PostgreSQL host")
+    parser.add_argument("--db-port", type=int, default=None, help="PostgreSQL port")
+    parser.add_argument("--db-user", type=str, default=None, help="PostgreSQL user")
+    parser.add_argument("--db-password", type=str, default=None, help="PostgreSQL password")
+    parser.add_argument("--db-name", type=str, default=None, help="PostgreSQL database name")
+
+    args = parser.parse_args()
+
+    immich_url = args.immich_url or os.getenv("IMMICH_URL") or "http://localhost:2283"
+    api_key = args.api_key or os.getenv("IMMICH_KEY") or os.getenv("IMMICH_API_KEY")
+
+    if not api_key and not args.dry_run:
+        print("[!] Error: IMMICH_KEY (or IMMICH_API_KEY) is required to trigger metadata refetch.")
+        print("    Please configure it in .env or pass via --api-key.")
+        sys.exit(1)
+
+    print("=" * 70)
+    print(" Immich Missing Video Metadata Detector & Refetcher")
+    print("=" * 70)
+    if args.dry_run:
+        print(" [!] DRY-RUN MODE: No jobs will be queued.")
+
+    missing_videos: List[Dict[str, Any]] = []
+
+    # 1. Try DB scan first unless --api-only is requested
+    if not args.api_only:
+        conn = get_db_connection(args)
+        if conn:
+            print("[*] Scanning video assets via PostgreSQL...")
+            try:
+                missing_videos = scan_videos_db(conn, args)
+                print(f"[✓] Database scan complete. Found {len(missing_videos)} videos needing metadata.")
+            finally:
+                conn.close()
+
+    # 2. Fall back to API scan if DB was not used or returned no connection
+    if not missing_videos and (args.api_only or get_db_connection(args) is None):
+        if not api_key:
+            print("[!] IMMICH_KEY is required for API scan. Please set IMMICH_KEY in .env.")
+            sys.exit(1)
+        missing_videos = scan_videos_api(immich_url, api_key, args)
+
+    print("\n" + "-" * 70)
+    print(" Scan Results")
+    print("-" * 70)
+    print(f"  • Videos with missing metadata : {len(missing_videos)}")
+    print("-" * 70)
+
+    if not missing_videos:
+        print("\n[✓] All videos have complete metadata! Nothing to refetch.")
+        return
+
+    # Sample output
+    sample_count = min(5, len(missing_videos))
+    print(f"\n[i] Sample targets ({sample_count} of {len(missing_videos)}):")
+    for item in missing_videos[:sample_count]:
+        reasons_str = ", ".join(item["reasons"])
+        print(f"  - [{item['id']}] {item['path']} -> ({reasons_str})")
+
+    if args.limit and len(missing_videos) > args.limit:
+        print(f"\n[i] Limiting action to first {args.limit} videos (as specified by --limit).")
+        missing_videos = missing_videos[:args.limit]
+
+    if args.dry_run:
+        print("\n[✓] Dry-run complete. Exiting without triggering jobs.")
+        return
+
+    if not args.yes:
+        confirm = input(f"\n[?] Trigger metadata refetch for {len(missing_videos)} videos? [y/N]: ").strip().lower()
+        if confirm != "y":
+            print("[*] Operation cancelled by user.")
+            return
+
+    target_ids = [item["id"] for item in missing_videos]
+    print(f"\n[*] Triggering metadata refetch via Immich API ({immich_url})...")
+    success, failed = trigger_metadata_refetch(immich_url, api_key, target_ids, batch_size=args.batch_size)
+
+    print("\n" + "=" * 70)
+    print(f" [✓] Completed: {success} queued successfully, {failed} failed.")
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    main()
